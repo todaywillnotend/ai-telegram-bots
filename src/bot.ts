@@ -5,13 +5,13 @@ import { BotConfig } from "./types";
 
 dotenv.config();
 
-interface Message {
+interface ChatMessage {
   role: "user" | "assistant";
   content: string;
 }
 
 interface UserContext {
-  messages: Message[];
+  messages: ChatMessage[];
   lastInteraction: number;
   postTopic?: string;
 }
@@ -54,9 +54,13 @@ export class TelegramBot {
     this.bot.on("message", async (ctx) => {
       try {
         const message = ctx.message;
+        if (!message) return;
 
-        // Пропускаем если нет сообщения или текста
-        if (!message || !("text" in message)) return;
+        // Получаем текст сообщения или подпись к медиа
+        const messageText = this.getMessageText(message);
+
+        // Пропускаем если нет текста или подписи
+        if (!messageText) return;
 
         // Получаем время сообщения (в секундах, преобразуем в миллисекунды)
         const messageTime = message.date * 1000;
@@ -71,51 +75,32 @@ export class TelegramBot {
 
         // Проверяем упомянули ли бота в сообщении
         const isBotMentioned =
-          this.botInfo && message.text.includes(`@${this.botInfo.username}`);
+          this.botInfo && messageText.includes(`@${this.botInfo.username}`);
 
         // Проверяем, является ли сообщение ответом на сообщение этого бота
-        const isReplyToBot =
-          message.reply_to_message &&
-          "from" in message.reply_to_message &&
-          message.reply_to_message.from?.id === this.botInfo?.id;
+        const isReplyToBot = this.isReplyToBot(message);
 
-        // Проверка, является ли сообщение перенаправленным из канала
-        // @ts-ignore
-        const isChannelPost =
-          // @ts-ignore
-          message.forward_from_chat &&
-          // @ts-ignore
-          message.forward_from_chat.type === "channel";
-
-        // Проверяем, является ли сообщение автоматически добавленным постом из связанного канала
-        // @ts-ignore
-        const isAutoAddedChannelPost =
-          !message.from &&
-          message.sender_chat &&
-          // @ts-ignore
-          message.sender_chat.type === "channel";
-
-        // Определяем, является ли сообщение постом канала (в любой форме)
-        const isAnyKindOfChannelPost = isChannelPost || isAutoAddedChannelPost;
+        // Определяем, является ли сообщение постом канала
+        const isAnyKindOfChannelPost = this.isChannelPost(message);
 
         // Если это сообщение - пост из канала (всегда отвечаем, даже на старые)
         if (
           isAnyKindOfChannelPost &&
           Math.random() < POST_COMMENT_PROBABILITY
         ) {
-          await this.commentPost(ctx);
+          await this.commentPost(ctx, messageText);
         }
         // Если это ответ на сообщение бота или упомянули бота конкретно,
         // и сообщение пришло после запуска бота
         else if ((isReplyToBot || isBotMentioned) && !isOldMessage) {
-          await this.handleDirectMessage(ctx);
+          await this.handleDirectMessage(ctx, messageText);
         }
         // Если это старое сообщение, логируем его для отладки
         else if (isOldMessage && (isReplyToBot || isBotMentioned)) {
           console.log(
             `[${this.config.BOT_NAME}] Игнорирую старое сообщение от ${
               message.from?.username || message.from?.id
-            }: ${message.text.substring(0, 50)}...`
+            }: ${messageText.substring(0, 50)}...`
           );
         }
       } catch (error) {
@@ -125,6 +110,49 @@ export class TelegramBot {
         );
       }
     });
+  }
+
+  // Вспомогательный метод для получения текста из разных типов сообщений
+  private getMessageText(message: any): string | null {
+    if ("text" in message && message.text) {
+      return message.text;
+    }
+    if ("caption" in message && message.caption) {
+      return message.caption;
+    }
+    return null;
+  }
+
+  // Проверка, является ли сообщение ответом на сообщение бота
+  private isReplyToBot(message: any): boolean {
+    if (!("reply_to_message" in message) || !message.reply_to_message) {
+      return false;
+    }
+
+    const replyMsg = message.reply_to_message;
+    return (
+      "from" in replyMsg &&
+      replyMsg.from &&
+      replyMsg.from.id === this.botInfo?.id
+    );
+  }
+
+  // Проверка, является ли сообщение постом из канала
+  private isChannelPost(message: any): boolean {
+    // Перенаправленное сообщение из канала
+    const isForwardedChannel =
+      "forward_from_chat" in message &&
+      message.forward_from_chat &&
+      message.forward_from_chat.type === "channel";
+
+    // Автоматически добавленный пост из связанного канала
+    const isAutoAddedPost =
+      !message.from &&
+      "sender_chat" in message &&
+      message.sender_chat &&
+      message.sender_chat.type === "channel";
+
+    return isForwardedChannel || isAutoAddedPost;
   }
 
   private getSystemPrompt() {
@@ -138,12 +166,11 @@ export class TelegramBot {
     );
   }
 
-  private async commentPost(ctx: Context) {
+  private async commentPost(ctx: Context, postText: string) {
     try {
       const message = ctx.message;
-      if (!message || !("text" in message)) return;
+      if (!message) return;
 
-      const postText = message.text;
       if (!postText || postText.length < 5) return; // Игнорируем слишком короткие посты
 
       console.log(
@@ -202,18 +229,15 @@ export class TelegramBot {
     }
   }
 
-  private async handleDirectMessage(ctx: Context) {
+  private async handleDirectMessage(ctx: Context, text: string) {
     const message = ctx.message;
-    if (!message || !("text" in message)) return;
-
-    const text = message.text;
+    if (!message) return;
 
     try {
       console.log(`[${this.config.BOT_NAME}] Получено сообщение:`, text);
 
       // Создаем уникальный ключ для пользователя (chatId_userId_botId)
-      const userId =
-        "from" in message && message.from ? message.from.id : "unknown";
+      const userId = message.from ? message.from.id : "unknown";
       const chatId = ctx.chat?.id || "unknown";
       const botId = this.botInfo?.id || "unknown";
       const userKey = `${chatId}_${userId}_${botId}`;
@@ -228,20 +252,19 @@ export class TelegramBot {
       let userContext = this.getUserContext(userKey);
 
       // Определяем тему поста, если это ответ на пост из канала
-      if (message.reply_to_message && "text" in message.reply_to_message) {
-        // Проверка является ли сообщение, на которое отвечают, постом канала
-        // @ts-ignore
-        const isReplyToChannelPost =
-          // @ts-ignore
-          message.reply_to_message.forward_from_chat ||
-          // @ts-ignore
-          (!message.reply_to_message.from &&
-            message.reply_to_message.sender_chat?.type === "channel");
+      if ("reply_to_message" in message && message.reply_to_message) {
+        const replyMessage = message.reply_to_message;
 
-        if (isReplyToChannelPost) {
-          userContext.postTopic = this.inferPostTopic(
-            message.reply_to_message.text
-          );
+        // Получаем текст из сообщения, на которое отвечают
+        const replyText = this.getMessageText(replyMessage);
+
+        if (replyText) {
+          // Проверяем, является ли сообщение, на которое отвечают, постом канала
+          const isReplyToChannelPost = this.isChannelPost(replyMessage);
+
+          if (isReplyToChannelPost) {
+            userContext.postTopic = this.inferPostTopic(replyText);
+          }
         }
       }
 
@@ -255,7 +278,7 @@ export class TelegramBot {
       }
 
       // Формируем запрос с учетом контекста и темы поста
-      const messages: Message[] = [
+      const messages: ChatMessage[] = [
         { role: "user", content: this.getSystemPrompt() },
       ];
 
