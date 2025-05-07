@@ -6,7 +6,7 @@ import { BotConfig } from "./types";
 dotenv.config();
 
 interface ChatMessage {
-  role: "user" | "assistant";
+  role: "user" | "assistant" | "system";
   content: string;
 }
 
@@ -14,16 +14,28 @@ interface UserContext {
   messages: ChatMessage[];
   lastInteraction: number;
   postTopic?: string;
+  messageCount: number; // Счетчик сообщений для периодической "настройки"
+  activeConversation: boolean; // Флаг активного разговора
 }
 
-// Время жизни контекста (30 минут)
-const CONTEXT_TTL = 30 * 60 * 1000;
+// Базовое время жизни контекста (30 минут)
+const BASE_CONTEXT_TTL = 30 * 60 * 1000;
+// Расширенное время жизни для активных бесед (2 часа)
+const ACTIVE_CONTEXT_TTL = 2 * 60 * 60 * 1000;
 
-// Максимальное количество сообщений в истории
-const MAX_HISTORY_LENGTH = 10;
+// История сообщений
+const DEFAULT_HISTORY_LENGTH = 15;
+const MAX_HISTORY_LENGTH = 30;
+const RELEVANT_HISTORY_LENGTH = 10; // Количество сообщений для отправки в API
 
 // Вероятность комментирования поста (100%)
 const POST_COMMENT_PROBABILITY = 1;
+
+// Количество сообщений, после которого повторяем настройку
+const REMINDER_INTERVAL = 10;
+
+// Максимальная длина сообщения Telegram
+const MAX_MESSAGE_LENGTH = 4096;
 
 export class TelegramBot {
   private bot: Telegraf;
@@ -31,14 +43,14 @@ export class TelegramBot {
   private userContexts: Map<string, UserContext>;
   private postContexts: Map<string, UserContext>;
   private botInfo: any;
-  private startupTime: number; // Время запуска бота
+  private startupTime: number;
 
   constructor(config: BotConfig) {
     this.config = config;
     this.userContexts = new Map<string, UserContext>();
     this.postContexts = new Map<string, UserContext>();
     this.bot = new Telegraf(this.config.BOT_TOKEN);
-    this.startupTime = Date.now(); // Инициализируем время запуска
+    this.startupTime = Date.now();
     this.setupHandlers();
   }
 
@@ -166,6 +178,50 @@ export class TelegramBot {
     );
   }
 
+  // Улучшенный метод определения темы поста с использованием NLP-подхода
+  private async inferPostTopic(postText: string): Promise<string> {
+    // Если пост слишком короткий, возвращаем общую тему
+    if (postText.length < 10) {
+      return "Общая тема";
+    }
+
+    try {
+      // Используем LLM для определения темы
+      const response = await axios.post(
+        "https://api.deepseek.com/chat/completions",
+        {
+          model: "deepseek-chat",
+          messages: [
+            {
+              role: "system",
+              content:
+                "Определи основную тему текста в 3-7 словах. Ответь только темой, без дополнительных пояснений.",
+            },
+            { role: "user", content: postText.substring(0, 500) }, // Берем только первые 500 символов
+          ],
+        },
+        {
+          headers: {
+            Authorization: `Bearer ${this.config.DEEPSEEK_API_KEY}`,
+            "Content-Type": "application/json",
+          },
+        }
+      );
+
+      let topic = response.data.choices[0].message.content.trim();
+      // Убираем лишние кавычки и точки
+      topic = topic.replace(/["'.]+$|^["'.]+/g, "");
+
+      return topic || "Общая тема";
+    } catch (error) {
+      console.error(`[${this.config.BOT_NAME}] Error inferring topic:`, error);
+
+      // Фолбэк на простой метод в случае ошибки
+      const topicMatch = postText.match(/^(.{1,50})[.!?]|^(.{1,50})/);
+      return topicMatch ? topicMatch[0] : "Общая тема";
+    }
+  }
+
   private async commentPost(ctx: Context, postText: string) {
     try {
       const message = ctx.message;
@@ -185,10 +241,14 @@ export class TelegramBot {
       const postKey = `post_${chatId}_${messageId}_${botId}`;
 
       // Определяем тему поста
-      const postTopic = this.inferPostTopic(postText);
+      const postTopic = await this.inferPostTopic(postText);
+      console.log(`[${this.config.BOT_NAME}] Тема поста: ${postTopic}`);
 
       // Получаем контекст или создаем новый
       let postContext = this.getPostContext(postKey, postTopic);
+
+      // Проверяем длину поста и обрабатываем длинные тексты
+      const truncatedPostText = this.truncateTextIfNeeded(postText, 4000);
 
       // Формируем запрос на комментирование поста
       const response = await axios.post(
@@ -196,36 +256,55 @@ export class TelegramBot {
         {
           model: "deepseek-chat",
           messages: [
-            { role: "user", content: this.getSystemPrompt() },
-            { role: "user", content: this.getPostCommentPrompt(postText) },
+            { role: "system", content: this.getSystemPrompt() },
+            {
+              role: "user",
+              content: this.getPostCommentPrompt(truncatedPostText),
+            },
           ],
+          max_tokens: 1000, // Ограничиваем длину ответа
         },
         {
           headers: {
             Authorization: `Bearer ${this.config.DEEPSEEK_API_KEY}`,
             "Content-Type": "application/json",
           },
+          timeout: 30000, // 30 секунд таймаут
         }
       );
 
       const botComment = response.data.choices[0].message.content;
 
       // Сохраняем в контексте поста
-      postContext.messages.push({ role: "user", content: postText });
+      postContext.messages.push({ role: "user", content: truncatedPostText });
       postContext.messages.push({ role: "assistant", content: botComment });
+      postContext.messageCount += 2;
 
       // Ограничиваем длину истории
       if (postContext.messages.length > MAX_HISTORY_LENGTH) {
         postContext.messages = postContext.messages.slice(-MAX_HISTORY_LENGTH);
       }
 
-      // Отправляем комментарий как ответ на пост
-      await ctx.reply(botComment, {
-        // @ts-ignore
-        reply_to_message_id: message.message_id,
-      });
+      // Отправляем комментарий как ответ на пост, разбивая на части при необходимости
+      await this.sendSplitMessage(ctx, botComment, message.message_id);
     } catch (error) {
       console.error(`[${this.config.BOT_NAME}] Error commenting post:`, error);
+
+      // Обработка специфических ошибок API
+      if (axios.isAxiosError(error) && error.response) {
+        console.error(
+          `API error: ${error.response.status}`,
+          error.response.data
+        );
+
+        // Обработка превышения rate limit
+        if (error.response.status === 429) {
+          console.log(
+            `[${this.config.BOT_NAME}] Rate limit exceeded. Waiting before retrying.`
+          );
+          // Можно реализовать отложенную повторную попытку
+        }
+      }
     }
   }
 
@@ -251,6 +330,9 @@ export class TelegramBot {
       // Получаем или создаем контекст для пользователя
       let userContext = this.getUserContext(userKey);
 
+      // Отмечаем беседу как активную
+      userContext.activeConversation = true;
+
       // Определяем тему поста, если это ответ на пост из канала
       if ("reply_to_message" in message && message.reply_to_message) {
         const replyMessage = message.reply_to_message;
@@ -263,76 +345,132 @@ export class TelegramBot {
           const isReplyToChannelPost = this.isChannelPost(replyMessage);
 
           if (isReplyToChannelPost) {
-            userContext.postTopic = this.inferPostTopic(replyText);
+            userContext.postTopic = await this.inferPostTopic(replyText);
           }
         }
       }
 
+      // Проверяем длину сообщения пользователя
+      const truncatedText = this.truncateTextIfNeeded(cleanText, 4000);
+
       // Добавляем сообщение пользователя в историю
-      userContext.messages.push({ role: "user", content: cleanText });
+      userContext.messages.push({ role: "user", content: truncatedText });
       userContext.lastInteraction = Date.now();
+      userContext.messageCount++;
+
+      // Проверяем, нужно ли напомнить о настройках
+      const needsReminderOfRole =
+        userContext.messageCount % REMINDER_INTERVAL === 0;
 
       // Ограничиваем длину истории
       if (userContext.messages.length > MAX_HISTORY_LENGTH) {
         userContext.messages = userContext.messages.slice(-MAX_HISTORY_LENGTH);
       }
 
-      // Формируем запрос с учетом контекста и темы поста
-      const messages: ChatMessage[] = [
-        { role: "user", content: this.getSystemPrompt() },
-      ];
+      // Формируем сообщения для API
+      const systemMessage: ChatMessage = {
+        role: "system",
+        content: this.getSystemPrompt(),
+      };
+
+      // Начинаем с системного сообщения
+      const messages: ChatMessage[] = [systemMessage];
+
+      // Если нужно напомнить о роли
+      if (needsReminderOfRole) {
+        messages.push({
+          role: "system",
+          content:
+            "Помни о своей роли и придерживайся заданного стиля общения.",
+        });
+      }
 
       // Добавляем контекст темы поста, если она есть
       if (userContext.postTopic) {
         messages.push({
-          role: "user",
+          role: "system",
           content: `Текущая тема обсуждения: ${userContext.postTopic}`,
         });
       }
 
-      // Добавляем историю сообщений
-      messages.push(...userContext.messages);
+      // Добавляем историю сообщений, выбирая наиболее релевантные
+      const relevantMessages = this.getRelevantMessages(userContext.messages);
+      messages.push(...relevantMessages);
 
-      // Вызов API DeepSeek
+      // Индикатор набора текста перед отправкой запроса
+      await ctx.telegram.sendChatAction(chatId, "typing");
+
+      // Вызов API DeepSeek с обработкой токенов
       const response = await axios.post(
         "https://api.deepseek.com/chat/completions",
         {
           model: "deepseek-chat",
           messages: messages,
+          max_tokens: 1500, // Ограничиваем длину ответа
         },
         {
           headers: {
             Authorization: `Bearer ${this.config.DEEPSEEK_API_KEY}`,
             "Content-Type": "application/json",
           },
+          timeout: 30000, // 30 секунд таймаут
         }
       );
 
       const botReply = response.data.choices[0].message.content;
 
+      // Проверка соответствия ответа правилам (простая реализация)
+      const sanitizedReply = this.sanitizeResponse(botReply);
+
       // Сохраняем ответ бота в контексте
-      userContext.messages.push({ role: "assistant", content: botReply });
+      userContext.messages.push({ role: "assistant", content: sanitizedReply });
+      userContext.messageCount++;
 
       // Обновляем контекст пользователя
       this.userContexts.set(userKey, userContext);
 
-      // Отправляем ответ
-      await ctx.reply(botReply, {
-        // @ts-ignore
-        reply_to_message_id: message.message_id,
-      });
+      // Отправляем ответ, разбивая длинные сообщения
+      await this.sendSplitMessage(ctx, sanitizedReply, message.message_id);
     } catch (error) {
       console.error(
         `[${this.config.BOT_NAME}] Error handling direct message:`,
         error
       );
 
-      // Ответ в случае ошибки
+      // Обработка специфических ошибок
+      if (axios.isAxiosError(error)) {
+        if (error.response?.status === 429) {
+          await ctx.reply(
+            "Извини, я сейчас немного перегружен. Попробуй через минуту.",
+            {
+              // @ts-ignore
+              reply_to_message_id: message.message_id,
+            }
+          );
+          return;
+        }
+
+        if (error.code === "ECONNABORTED") {
+          await ctx.reply(
+            "Извини, запрос занял слишком много времени. Попробуй задать более краткий вопрос.",
+            {
+              // @ts-ignore
+              reply_to_message_id: message.message_id,
+            }
+          );
+          return;
+        }
+      }
+
+      // Общий ответ в случае ошибки
       if (ctx.chat) {
-        await ctx.reply("Ой, что-то пошло не так 🤖", {
-          // @ts-ignore
-          reply_to_message_id: message.message_id,
-        });
+        await ctx.reply(
+          "Ой, что-то пошло не так 🤖 Технические проблемы, попробуй позже.",
+          {
+            // @ts-ignore
+            reply_to_message_id: message.message_id,
+          }
+        );
       }
     }
   }
@@ -347,6 +485,8 @@ export class TelegramBot {
       this.userContexts.set(userKey, {
         messages: [],
         lastInteraction: Date.now(),
+        messageCount: 0,
+        activeConversation: false,
       });
     }
 
@@ -364,6 +504,8 @@ export class TelegramBot {
         messages: [],
         lastInteraction: Date.now(),
         postTopic: postTopic,
+        messageCount: 0,
+        activeConversation: false,
       });
     } else if (postTopic) {
       // Обновляем тему, если она предоставлена
@@ -375,30 +517,124 @@ export class TelegramBot {
     return this.postContexts.get(postKey)!;
   }
 
-  // Функция для очистки старых контекстов
+  // Функция для очистки старых контекстов с динамическим TTL
   private cleanupOldContexts() {
     const now = Date.now();
 
     // Очистка пользовательских контекстов
     for (const [key, context] of this.userContexts.entries()) {
-      if (now - context.lastInteraction > CONTEXT_TTL) {
+      const ttl = context.activeConversation
+        ? ACTIVE_CONTEXT_TTL
+        : BASE_CONTEXT_TTL;
+      if (now - context.lastInteraction > ttl) {
         this.userContexts.delete(key);
       }
     }
 
     // Очистка контекстов постов
     for (const [key, context] of this.postContexts.entries()) {
-      if (now - context.lastInteraction > CONTEXT_TTL) {
+      const ttl = context.activeConversation
+        ? ACTIVE_CONTEXT_TTL
+        : BASE_CONTEXT_TTL;
+      if (now - context.lastInteraction > ttl) {
         this.postContexts.delete(key);
       }
     }
   }
 
-  // Функция для определения темы поста
-  private inferPostTopic(text: string): string {
-    // Простая реализация - берем первые 50 символов или до первого знака препинания
-    const topicMatch = text.match(/^(.{1,50})[.!?]|^(.{1,50})/);
-    return topicMatch ? topicMatch[0] : "Общая тема";
+  // Функция для выбора наиболее релевантных сообщений из истории
+  private getRelevantMessages(messages: ChatMessage[]): ChatMessage[] {
+    if (messages.length <= RELEVANT_HISTORY_LENGTH) {
+      return messages;
+    }
+
+    // Стратегия 1: Берем последние N сообщений (самые недавние)
+    return messages.slice(-RELEVANT_HISTORY_LENGTH);
+
+    // Альтернативная стратегия (можно реализовать):
+    // Взять первые 2 сообщения для контекста + последние (N-2) сообщений
+  }
+
+  // Функция для проверки ответа на соответствие правилам
+  private sanitizeResponse(response: string): string {
+    // Здесь можно добавить фильтрацию для соблюдения правил
+    // Например, удаление определенных фраз, проверка на нежелательный контент и т.д.
+
+    // Простая проверка, что ответ не слишком короткий
+    if (response.length < 5) {
+      return "Извини, не могу сформулировать подходящий ответ. Можешь уточнить вопрос?";
+    }
+
+    return response;
+  }
+
+  // Функция для отправки длинного сообщения с разбиением
+  private async sendSplitMessage(
+    ctx: Context,
+    text: string,
+    replyToMessageId?: number
+  ) {
+    if (text.length <= MAX_MESSAGE_LENGTH) {
+      await ctx.reply(text, {
+        // @ts-ignore
+        reply_to_message_id: replyToMessageId,
+      });
+      return;
+    }
+
+    // Разбиваем на части
+    const parts = [];
+    let remainingText = text;
+
+    while (remainingText.length > 0) {
+      // Находим хорошее место для разбиения (после предложения или абзаца)
+      let splitIndex = MAX_MESSAGE_LENGTH;
+      if (splitIndex < remainingText.length) {
+        // Ищем ближайший конец предложения или абзаца
+        const sentenceEnd = remainingText.lastIndexOf(". ", splitIndex);
+        const lineBreak = remainingText.lastIndexOf("\n", splitIndex);
+
+        if (sentenceEnd > 0 && sentenceEnd > lineBreak) {
+          splitIndex = sentenceEnd + 1; // +1 чтобы включить точку
+        } else if (lineBreak > 0) {
+          splitIndex = lineBreak + 1; // +1 чтобы включить перенос строки
+        } else {
+          // Если не нашли удобного места, ищем пробел
+          const spaceIndex = remainingText.lastIndexOf(" ", splitIndex);
+          if (spaceIndex > 0) {
+            splitIndex = spaceIndex + 1; // +1 чтобы включить пробел
+          }
+        }
+      }
+
+      // Добавляем часть
+      parts.push(remainingText.substring(0, splitIndex));
+      remainingText = remainingText.substring(splitIndex);
+    }
+
+    // Отправляем каждую часть
+    for (let i = 0; i < parts.length; i++) {
+      const isFirstPart = i === 0;
+      await ctx.reply(parts[i], {
+        // @ts-ignore
+        reply_to_message_id: isFirstPart ? replyToMessageId : undefined,
+      });
+
+      // Небольшая задержка между сообщениями, чтобы избежать флуда
+      if (i < parts.length - 1) {
+        await new Promise((resolve) => setTimeout(resolve, 500));
+      }
+    }
+  }
+
+  // Функция для обрезки длинного текста
+  private truncateTextIfNeeded(text: string, maxLength: number): string {
+    if (text.length <= maxLength) {
+      return text;
+    }
+
+    // Обрезаем и добавляем пометку, что текст был сокращен
+    return text.substring(0, maxLength) + "... [текст сокращен из-за длины]";
   }
 
   // Запуск бота
