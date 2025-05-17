@@ -20,3 +20,22 @@ bot
 // Обработка сигналов завершения
 process.on("SIGINT", () => bot.stop("SIGINT"));
 process.on("SIGTERM", () => bot.stop("SIGTERM"));
+
+process.on("message", async (message) => {
+  if (message === "shutdown") {
+    console.log(
+      `[${config.BOT_NAME}] Получено сообщение о завершении, останавливаю бота...`
+    );
+
+    // Останавливаем бота корректно
+    await bot.stop();
+
+    // Выходим из процесса
+    setTimeout(() => {
+      process.exit(0);
+    }, 500);
+  }
+});
+
+// Отправляем сообщение о готовности после успешной инициализации
+process.send?.("ready");

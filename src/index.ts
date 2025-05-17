@@ -3,6 +3,14 @@ import * as path from "path";
 import { fork, ChildProcess } from "child_process";
 import { BotConfig, ProcessSignal } from "./types";
 
+interface WorkerLogMessage {
+  type: string;
+  content: string;
+}
+
+// Отслеживаем состояние завершения
+let isShuttingDown = false;
+
 // Функция для загрузки конфигурации ботов
 function loadBotConfigs(): BotConfig[] {
   const configsFolder = path.join(__dirname, "../configs");
@@ -87,6 +95,65 @@ function loadBotConfigs(): BotConfig[] {
   return configs;
 }
 
+/**
+ * Останавливает всех воркеров и ждет их корректного завершения
+ * @param workers Массив дочерних процессов
+ * @param signal Сигнал для отправки дочерним процессам
+ * @returns Promise, который разрешится после завершения всех воркеров
+ */
+async function stopAllWorkers(
+  workers: ChildProcess[],
+  signal: ProcessSignal
+): Promise<void> {
+  if (isShuttingDown) return; // Предотвращаем двойное завершение
+
+  isShuttingDown = true;
+  console.log(
+    `\n[${new Date().toISOString()}] Получен сигнал ${signal}, останавливаем всех ботов...`
+  );
+
+  // Отправляем сообщение о завершении всем воркерам
+  for (const worker of workers) {
+    if (worker.connected) {
+      worker.send("shutdown");
+    }
+  }
+
+  // Даем воркерам время для корректного завершения
+  await new Promise<void>((resolve) => {
+    const checkInterval = setInterval(() => {
+      // Проверяем, остались ли запущенные воркеры
+      const runningWorkers = workers.filter(
+        (w) => !w.killed && w.exitCode === null
+      );
+
+      if (runningWorkers.length === 0) {
+        clearInterval(checkInterval);
+        resolve();
+      }
+    }, 100);
+
+    // Страховка: устанавливаем максимальное время ожидания
+    setTimeout(() => {
+      clearInterval(checkInterval);
+
+      // Принудительно завершаем не остановившиеся воркеры
+      for (const worker of workers) {
+        if (!worker.killed && worker.exitCode === null) {
+          console.log(`Принудительное завершение воркера PID ${worker.pid}`);
+          worker.kill(signal);
+        }
+      }
+
+      resolve();
+    }, 5000); // 5 секунд на корректное завершение
+  });
+
+  console.log(
+    `[${new Date().toISOString()}] Все боты остановлены, завершение приложения`
+  );
+}
+
 // Основная функция запуска
 async function main() {
   const botConfigs = loadBotConfigs();
@@ -139,10 +206,33 @@ async function main() {
         console.error(`Ошибка в процессе бота ${config.BOT_NAME}:`, err);
       });
 
-      worker.on("exit", (code) => {
+      worker.on("exit", (code, signal) => {
         console.log(
-          `Процесс бота ${config.BOT_NAME} завершился с кодом ${code}`
+          `Процесс бота ${
+            config.BOT_NAME
+          } завершился с кодом ${code} (сигнал: ${signal || "нет"})`
         );
+      });
+
+      // Добавляем обработчик сообщений от воркера
+      worker.on("message", (message: unknown) => {
+        if (message === "ready") {
+          console.log(
+            `Бот ${config.BOT_NAME} успешно инициализирован и готов к работе`
+          );
+        }
+        // Проверяем, является ли сообщение объектом с типом 'log'
+        else if (
+          typeof message === "object" &&
+          message !== null &&
+          "type" in message &&
+          (message as { type: string }).type === "log" &&
+          "content" in message
+        ) {
+          // Приводим к безопасному типу после проверки
+          const logMessage = message as WorkerLogMessage;
+          console.log(`[${config.BOT_NAME}] ${logMessage.content}`);
+        }
       });
     } catch (err) {
       console.error(`Не удалось запустить бота ${config.BOT_NAME}:`, err);
@@ -150,20 +240,30 @@ async function main() {
     }
   }
 
-  // Исправляем тип сигнала
-  const stopWorkers = (signal: ProcessSignal) => {
-    console.log(`Получен сигнал ${signal}, останавливаем всех ботов...`);
-    for (const worker of workers) {
-      worker.kill(signal);
-    }
+  // Обработчики сигналов завершения
+  process.once("SIGINT", async () => {
+    await stopAllWorkers(workers, "SIGINT");
     process.exit(0);
-  };
+  });
 
-  process.once("SIGINT", () => stopWorkers("SIGINT"));
-  process.once("SIGTERM", () => stopWorkers("SIGTERM"));
+  process.once("SIGTERM", async () => {
+    await stopAllWorkers(workers, "SIGTERM");
+    process.exit(0);
+  });
+
+  // Обработка необработанных исключений
+  process.on("uncaughtException", async (error) => {
+    console.error("Необработанное исключение:", error);
+    await stopAllWorkers(workers, "SIGTERM");
+    process.exit(1);
+  });
+
+  console.log(
+    `[${new Date().toISOString()}] Все боты запущены и работают. Для завершения нажмите Ctrl+C`
+  );
 }
 
-main().catch((err) => {
+main().catch(async (err) => {
   console.error("Ошибка в основной функции:", err);
   process.exit(1);
 });
