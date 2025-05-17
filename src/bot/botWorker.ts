@@ -1,5 +1,5 @@
 import { TelegramBot } from "./bot"; // Импортируйте класс TelegramBot
-import { BotConfig } from "./types"; // Создайте файл с типами
+import { BotConfig } from "../types"; // Создайте файл с типами
 
 // Получаем конфигурацию бота из аргументов командной строки
 const configString = process.argv[2];

@@ -112,7 +112,7 @@ async function main() {
       if (isDevelopment) {
         // Режим разработки: используем ts-node для запуска TypeScript файлов
         const tsNodePath = path.join(__dirname, "../node_modules/.bin/ts-node");
-        const botWorkerPath = path.join(__dirname, "./bot-worker.ts");
+        const botWorkerPath = path.join(__dirname, "./bot/botWorker.ts");
 
         console.log(`Запуск worker в режиме разработки: ${botWorkerPath}`);
         worker = fork(botWorkerPath, [configString], {
@@ -122,7 +122,7 @@ async function main() {
       } else {
         // Режим продакшн: используем скомпилированные JS файлы
         // Вычисляем путь к bot-worker.js относительно текущего файла
-        const botWorkerPath = path.join(__dirname, "bot-worker.js");
+        const botWorkerPath = path.join(__dirname, "./bot/botWorker.js");
 
         console.log(`Запуск worker в режиме продакшн: ${botWorkerPath}`);
         console.log(

@@ -1,21 +1,23 @@
 export interface BotConfig {
   BOT_TOKEN: string;
+  BOT_NAME: string;
   DEEPSEEK_API_KEY: string;
   SYSTEM_PROMPT: string;
   POST_COMMENT_PROMPT_TEMPLATE: string;
-  BOT_NAME: string;
   IGNORE_MESSAGES_OLDER_THAN_MINS?: number;
 }
 
-export interface Message {
-  role: "user" | "assistant";
+export interface ChatMessage {
+  role: "user" | "assistant" | "system";
   content: string;
 }
 
 export interface UserContext {
-  messages: Message[];
+  messages: ChatMessage[];
   lastInteraction: number;
   postTopic?: string;
+  messageCount: number; // Счетчик сообщений для периодической "настройки"
+  activeConversation: boolean; // Флаг активного разговора
 }
 
 // Добавляем тип для сигналов процесса
